@@ -29,12 +29,10 @@ import org.apache.maven.plugin.MojoExecutionException;
 import org.apache.maven.project.MavenProject;
 import org.apache.maven.reporting.AbstractMavenReport;
 import org.apache.maven.reporting.MavenReportException;
-import org.jacoco.core.analysis.Analyzer;
-import org.jacoco.core.analysis.IBundleCoverage;
-import org.jacoco.core.analysis.ICoverageNode;
-import org.jacoco.core.analysis.ICoverageVisitor;
-import org.jacoco.core.analysis.IMethodCoverage;
-import org.jacoco.core.data.ExecFileLoader;
+import org.jacoco.core.analysis.*;
+import org.jacoco.core.internal.analysis.ClassCoverageImpl;
+import org.jacoco.core.internal.analysis.filter.Filters;
+import org.jacoco.core.tools.ExecFileLoader;
 import org.jacoco.core.data.ExecutionData;
 import org.jacoco.core.data.ExecutionDataStore;
 import org.jacoco.core.data.SessionInfoStore;
@@ -404,22 +402,38 @@ public class ReportMojo extends AbstractMavenReport {
 
         @Override
         public void analyzeClass(final ClassReader reader) {
-            final ClassVisitor visitor = createSanitizingVisitor(CRC64.checksum(reader.b));
+            final long classid = CRC64.classId(reader.b);
+            final ExecutionData data = executionData.get(classid);
+
+            final ClassVisitor visitor = createSanitizingVisitor(classid, data != null ? data.getName() : null);
             reader.accept(visitor, 0);
         }
 
-        private ClassVisitor createSanitizingVisitor(final long classid) {
+        @Override
+        public void analyzeClass(final byte[] buffer, final String location) {
+            ClassReader reader = new ClassReader(buffer);
+            final ClassVisitor visitor = createSanitizingVisitor(CRC64.classId(buffer), reader.getClassName());
+            reader.accept(visitor, 0);
+        }
+
+        private ClassVisitor createSanitizingVisitor(final long classid, final String location) {
             final ExecutionData data = executionData.get(classid);
             final boolean[] probes = data == null ? null : data.getProbes();
             final StringPool stringPool = new StringPool();
-            final ClassProbesVisitor analyzer = new SanitizingClassAnalyzer(classid, probes, stringPool, coverageVisitor,
+            ClassCoverageImpl coverage = new ClassCoverageImpl(location, classid, probes == null);
+            final ClassProbesVisitor analyzer = new SanitizingClassAnalyzer(coverage, probes, stringPool, coverageVisitor,
                     filter);
-            return new ClassProbesAdapter(analyzer);
+            return new ClassProbesAdapter(analyzer, false);
         }
     }
 
     private static interface MethodCoverageFilter {
         Collection<IMethodCoverage> filter(final Collection<IMethodCoverage> methodCoverages);
+    }
+
+
+    private static interface ClassCoverageFilter {
+        Collection<IClassCoverage> filter(final Collection<IClassCoverage> classCoverages);
     }
 
     private static final class Filters implements MethodCoverageFilter {
@@ -479,34 +493,62 @@ public class ReportMojo extends AbstractMavenReport {
         }
     }
 
+    private static final class NewSerializableFilter implements ClassCoverageFilter {
+
+        @Override
+        public Collection<IClassCoverage> filter(Collection<IClassCoverage> classCoverages) {
+            final Collection<IClassCoverage> filtered = new ArrayList<>();
+            for (final IClassCoverage classCoverage : classCoverages) {
+                final String className = classCoverage.getName();
+                if (className.endsWith("new Serializable() {...}")) {
+                    filtered.add(classCoverage);
+                }
+            }
+            return filtered;
+
+        }
+    }
+
+
+
     private static final class SanitizingClassAnalyzer extends ClassAnalyzer {
         private final StringPool stringPool;
         private final boolean[] probes;
         private final Collection<IMethodCoverage> methodCoveragesToAdd = new ArrayList<IMethodCoverage>();
         private final ICoverageVisitor coverageVisitor;
         private final MethodCoverageFilter filter;
+        private final ClassCoverageImpl coverage;
 
-        private SanitizingClassAnalyzer(final long classid, final boolean[] probes, final StringPool stringPool,
+        private SanitizingClassAnalyzer(ClassCoverageImpl coverage, final boolean[] probes, final StringPool stringPool,
                 final ICoverageVisitor coverageVisitor, final MethodCoverageFilter filter) {
-            super(classid, probes, stringPool);
+            super(coverage, probes, stringPool);
             this.stringPool = stringPool;
             this.probes = probes;
             this.coverageVisitor = coverageVisitor;
             this.filter = filter;
+            this.coverage = coverage;
+        }
+
+        @Override
+        public void visitInnerClass(String name, String outerName, String innerName, int access) {
+            super.visitInnerClass(name, outerName, innerName, access);
         }
 
         @Override
         public MethodProbesVisitor visitMethod(final int access, final String name, final String desc,
                 final String signature, final String[] exceptions) {
 
-            InstrSupport.assertNotInstrumented(name, getCoverage().getName());
+            InstrSupport.assertNotInstrumented(name, coverage.getName());
 
             // TODO: Use filter hook
             if ((access & Opcodes.ACC_SYNTHETIC) != 0) {
                 return null;
             }
 
-            return new MethodAnalyzer(stringPool.get(name), stringPool.get(desc), stringPool.get(signature), probes) {
+            return new MethodAnalyzer(coverage.getName(), coverage.getSuperName(),
+                    stringPool.get(name), stringPool.get(desc),
+                    stringPool.get(signature), probes,
+                    org.jacoco.core.internal.analysis.filter.Filters.ALL) {
                 @Override
                 public void visitEnd() {
                     super.visitEnd();
@@ -526,14 +568,14 @@ public class ReportMojo extends AbstractMavenReport {
                 visitSanitizedMethods();
             } finally {
                 super.visitEnd();
-                coverageVisitor.visitCoverage(getCoverage());
+                coverageVisitor.visitCoverage(coverage);
             }
         }
 
         private void visitSanitizedMethods() {
             final Collection<IMethodCoverage> filtered = filter.filter(methodCoveragesToAdd);
             for (final IMethodCoverage methodCoverage : filtered) {
-                getCoverage().addMethod(methodCoverage);
+                coverage.addMethod(methodCoverage);
             }
         }
     }
